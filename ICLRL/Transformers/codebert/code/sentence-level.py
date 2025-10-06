@@ -1,0 +1,414 @@
+import os
+import random
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup,AutoModelForSeq2SeqLM
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (accuracy_score, precision_score, recall_score, 
+                           f1_score, matthews_corrcoef, confusion_matrix)
+from tqdm import tqdm
+from torch.optim import AdamW
+import csv
+from collections import defaultdict
+from datetime import datetime
+import time
+import psutil
+import GPUtil
+
+class Config:
+    MODEL_NAMES = {
+        'codebert': 'microsoft/codebert-base'
+    }
+    
+    # Training parameters
+    SEED = 1020   #42  1200 5000 520
+    BATCH_SIZE = 16
+    MAX_LEN = 512
+    EPOCHS = 50
+    LEARNING_RATE = 2e-5
+    EARLY_STOPPING_PATIENCE = 5
+    WEIGHT_DECAY = 0.01
+    WARMUP_STEPS = 100
+    
+    # Paths
+    DATA_PATH = "E:/models/workB/ICLRL/data/assembly2025.csv"
+    SAVE_DIR = "E:/models/workB/ICLRL/Transformers/codebert/results-sentence/seed5"
+    METRICS_FILE = "E:/models/workB/ICLRL/Transformers/codebert/results-sentence/seed5/training_metrics.csv"
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class AssemblyDataset(Dataset):
+    def __init__(self, texts, labels, tokenizer, max_len):
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+    
+    def __len__(self):
+        return len(self.texts)
+    
+    def __getitem__(self, idx):
+        text = str(self.texts[idx])
+        label = int(self.labels[idx])
+        
+        encoding = self.tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_len,
+            return_token_type_ids=False,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt',
+        )
+        
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'labels': torch.tensor(label, dtype=torch.long)
+        }
+
+class AssemblyClassifier(nn.Module):
+    def __init__(self, model_name, n_classes=2, freeze_bert=True):
+        super(AssemblyClassifier, self).__init__()
+        self.transformer = AutoModel.from_pretrained(model_name)
+        self.dropout = nn.Dropout(0.1)
+        self.classifier = nn.Linear(self.transformer.config.hidden_size, n_classes)
+        
+        if freeze_bert:
+            # Freeze all layers first
+            for param in self.transformer.parameters():
+                param.requires_grad = False
+            
+            # # Unfreeze last 2 transformer layers
+            # for layer in self.transformer.encoder.layer[-2:]:
+            #     for param in layer.parameters():
+            #         param.requires_grad = True
+            
+            # Ensure classifier head is always trainable
+            for param in self.classifier.parameters():
+                param.requires_grad = True
+            for param in self.dropout.parameters():
+                param.requires_grad = True
+    
+    def forward(self, input_ids, attention_mask):
+        # Forward pass (gradients will flow only through last 2 layers + classifier)
+        outputs = self.transformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+        
+        # Use CLS token embedding
+        pooled_output = outputs.last_hidden_state[:, 0, :]
+        pooled_output = self.dropout(pooled_output)
+        return self.classifier(pooled_output), None  # Return None for attentions
+class AssemblyTrainer:
+    def __init__(self, model, tokenizer, device, config, special_tokens):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = device
+        self.config = config
+        self.special_tokens = special_tokens
+        self.best_f1 = 0
+        self.early_stopping_counter = 0
+        self.start_time = time.time()
+        
+        os.makedirs(config.SAVE_DIR, exist_ok=True)
+        
+        if not os.path.exists(config.METRICS_FILE):
+            with open(config.METRICS_FILE, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'timestamp', 'model_name', 'epoch', 
+                    'train_loss', 'val_loss', 'train_f1', 'val_f1',
+                    'accuracy', 'precision', 'recall', 'f2_score', 'mcc',
+                    'tp', 'tn', 'fp', 'fn', 'train_time', 'gpu_mem', 'params'
+                ])
+    def get_disk_usage(self):
+        """Returns disk usage in MB for the save directory"""
+        total_size = 0
+        for dirpath, dirnames, filenames in os.walk(self.config.SAVE_DIR):
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                total_size += os.path.getsize(fp)
+        return total_size / (1024 * 1024)  # Convert to MB
+
+    def measure_inference_time(self, dataloader, num_runs=10):
+        """Measures average inference time in seconds"""
+        self.model.eval()
+        start_time = time.time()
+        with torch.no_grad():
+            for _ in range(num_runs):
+                for batch in dataloader:
+                    input_ids = batch['input_ids'].to(self.device)
+                    attention_mask = batch['attention_mask'].to(self.device)
+                    _ = self.model(input_ids, attention_mask)
+        return (time.time() - start_time) / num_runs
+    def get_gpu_memory(self):
+        if torch.cuda.is_available():
+            gpu = GPUtil.getGPUs()[0]
+            return gpu.memoryUsed
+        return 0
+    
+    def count_parameters(self):
+        return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+    
+    def train_epoch(self, dataloader, optimizer, scheduler):
+        self.model.train()
+        losses = []
+        preds = []
+        targets = []
+        
+        progress_bar = tqdm(dataloader, desc="Training", leave=False)
+        for batch in progress_bar:
+            optimizer.zero_grad()
+            
+            input_ids = batch['input_ids'].to(self.device)
+            attention_mask = batch['attention_mask'].to(self.device)
+            labels = batch['labels'].to(self.device)
+            
+            outputs, _ = self.model(input_ids, attention_mask)
+            loss = nn.CrossEntropyLoss()(outputs, labels)
+            loss.backward()
+            
+            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+            
+            losses.append(loss.item())
+            _, pred = torch.max(outputs, dim=1)
+            preds.extend(pred.cpu().numpy())
+            targets.extend(labels.cpu().numpy())
+            
+            progress_bar.set_postfix({'loss': np.mean(losses)})
+
+        train_loss = np.mean(losses)
+        train_f1 = f1_score(targets, preds, average='binary')
+        return train_loss, train_f1
+        
+    def evaluate(self, dataloader):
+        self.model.eval()
+        losses = []
+        preds = []
+        targets = []
+        
+        with torch.no_grad():
+            for batch in tqdm(dataloader, desc="Evaluating", leave=False):
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                labels = batch['labels'].to(self.device)
+                
+                outputs, _ = self.model(input_ids, attention_mask)
+                loss = nn.CrossEntropyLoss()(outputs, labels)
+                
+                losses.append(loss.item())
+                _, pred = torch.max(outputs, dim=1)
+                preds.extend(pred.cpu().numpy())
+                targets.extend(labels.cpu().numpy())
+        
+        loss = np.mean(losses)
+        accuracy = accuracy_score(targets, preds)
+        precision = precision_score(targets, preds, average='binary')
+        recall = recall_score(targets, preds, average='binary')
+        f1 = f1_score(targets, preds, average='binary')
+        f2 = (5 * precision * recall) / (4 * precision + recall)
+        mcc = matthews_corrcoef(targets, preds)
+        
+        # Confusion matrix
+        tn, fp, fn, tp = confusion_matrix(targets, preds).ravel()
+        
+        return loss, f1, {
+    'accuracy': accuracy,
+    'precision': precision,
+    'recall': recall,
+    'f1_score': f1,  # <-- Add this line
+    'f2_score': f2,
+    'mcc': mcc,
+    'tp': tp,
+    'tn': tn,
+    'fp': fp,
+    'fn': fn
+}
+    
+    def save_metrics(self, model_name, epoch, train_loss, val_loss, train_f1, val_f1, metrics):
+        train_time = time.time() - self.start_time
+        gpu_mem = self.get_gpu_memory()
+        params = self.count_parameters()
+        
+        with open(self.config.METRICS_FILE, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                model_name,
+                epoch,
+                train_loss,
+                val_loss,
+                train_f1,
+                val_f1,
+                metrics['accuracy'],
+                metrics['precision'],
+                metrics['recall'],
+                metrics['f2_score'],
+                metrics['mcc'],
+                metrics['tp'],
+                metrics['tn'],
+                metrics['fp'],
+                metrics['fn'],
+                train_time,
+                gpu_mem,
+                params
+            ])
+    
+    def print_metrics(self, metrics, prefix=""):
+        print(f"\n{prefix} Metrics:")
+        print(f"Accuracy: {metrics['accuracy']:.4f}")
+        print(f"Precision: {metrics['precision']:.4f}")
+        print(f"Recall: {metrics['recall']:.4f}")
+        print(f"F1 Score: {metrics['f1_score']:.4f}")
+        print(f"MCC: {metrics['mcc']:.4f}")
+        print(f"TP: {metrics['tp']} | TN: {metrics['tn']} | FP: {metrics['fp']} | FN: {metrics['fn']}")
+    
+    def train(self, train_loader, val_loader, test_loader, optimizer, scheduler, model_name):
+        for epoch in range(1, self.config.EPOCHS + 1):
+            print(f"\nEpoch {epoch}/{self.config.EPOCHS}")
+            
+            train_loss, train_f1 = self.train_epoch(train_loader, optimizer, scheduler)
+            val_loss, val_f1, val_metrics = self.evaluate(val_loader)
+            
+            print(f"Train Loss: {train_loss:.4f} | Train F1: {train_f1:.4f}")
+            print(f"Val Loss: {val_loss:.4f} | Val F1: {val_f1:.4f}")
+            self.print_metrics(val_metrics, "Validation")
+            
+            self.save_metrics(model_name, epoch, train_loss, val_loss, train_f1, val_f1, val_metrics)
+            
+            if val_f1 > self.best_f1:
+                self.best_f1 = val_f1
+                self.early_stopping_counter = 0
+                
+                safe_model_name = model_name.replace('/', '_')
+                model_path = os.path.join(self.config.SAVE_DIR, f"best_model_{safe_model_name}.pt")
+                tokenizer_path = os.path.join(self.config.SAVE_DIR, f"tokenizer_{safe_model_name}")
+
+                os.makedirs(os.path.dirname(model_path), exist_ok=True)
+
+                # Save model checkpoint
+                torch.save({
+                    'model_state_dict': self.model.state_dict(),
+                    'tokenizer_name': model_name,
+                    'special_tokens': self.special_tokens,
+                    'config': self.config,
+                    'tokenizer_config': self.tokenizer.init_kwargs
+                }, model_path)
+
+                # ✅ Save tokenizer in Hugging Face format
+                self.tokenizer.save_pretrained(tokenizer_path)
+
+                # Save test loader
+                test_loader_path = os.path.join(self.config.SAVE_DIR, "test_loader.pt")
+                torch.save(test_loader, test_loader_path)
+            
+                print(f"Trainable Parameters: {self.count_parameters():,}")
+                
+                print(f"\nNew best model saved with Val F1: {val_f1:.4f}")
+            else:
+                self.early_stopping_counter += 1
+                if self.early_stopping_counter >= self.config.EARLY_STOPPING_PATIENCE:
+                    print(f"Early stopping triggered at epoch {epoch}")
+                    break
+        # Evaluate on test set after training
+        test_loss, test_f1, test_metrics = self.evaluate(test_loader)
+        self.print_metrics(test_metrics, "Test")
+
+        # Get resource stats
+        total_train_time = time.time() - self.start_time
+        gpu_memory = self.get_gpu_memory()
+        disk_usage = self.get_disk_usage()
+
+        # Save test metrics and resource usage to a text file
+        test_metrics_path = os.path.join(self.config.SAVE_DIR, "test_metrics.txt")
+        with open(test_metrics_path, 'w') as f:
+            f.write("Test Metrics:\n")
+            f.write(f"Loss: {test_loss:.4f}\n")
+            for key, value in test_metrics.items():
+                f.write(f"{key.replace('_', ' ').capitalize()}: {value:.4f}\n" if isinstance(value, float) else f"{key.replace('_', ' ').capitalize()}: {value}\n")
+            
+            f.write("\nResource Usage:\n")
+            f.write(f"Total Training Time: {total_train_time:.2f} seconds\n")
+            f.write(f"GPU Memory Used: {gpu_memory} MB\n")
+            f.write(f"Disk Space Used: {disk_usage:.2f} MB\n")
+
+def get_stratified_splits(texts, labels, seed):
+    train_val_texts, test_texts, train_val_labels, test_labels = train_test_split(
+        texts, labels, test_size=0.1, stratify=labels, random_state=seed)
+    
+    train_texts, val_texts, train_labels, val_labels = train_test_split(
+        train_val_texts, train_val_labels, test_size=0.111, stratify=train_val_labels, random_state=seed)
+    
+    # Save test set as CSV
+    test_df = pd.DataFrame({'func': test_texts, 'label': test_labels})
+    test_df.to_csv(os.path.join(Config.SAVE_DIR, "test_set.csv"), index=False)
+    
+    # Save another copy with a different name if needed
+    test_df.to_csv(os.path.join(Config.SAVE_DIR, "test_set_copy.csv"), index=False)
+    
+    return (train_texts, train_labels), (val_texts, val_labels), (test_texts, test_labels)
+def train_model():
+    config = Config()
+    
+    # Set all seeds
+    random.seed(config.SEED)
+    np.random.seed(config.SEED)
+    torch.manual_seed(config.SEED)
+    torch.cuda.manual_seed_all(config.SEED)
+    
+    # Load and shuffle data
+    df = pd.read_csv(config.DATA_PATH).sample(frac=1, random_state=config.SEED)
+    texts = df['func'].values
+    labels = df['label'].values
+    
+    for model_name in config.MODEL_NAMES.values():
+        print(f"\n{'='*50}")
+        print(f"Training {model_name}")
+        print(f"{'='*50}")
+        
+        # Initialize tokenizer and add special tokens
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        special_tokens = ['<hex>', '<reg>', '<mem>', '<imm>', '<label>', '<inst>']
+        tokenizer.add_tokens(special_tokens)
+        
+        # Create stratified splits
+        (train_texts, train_labels), (val_texts, val_labels), (test_texts, test_labels) = \
+            get_stratified_splits(texts, labels, config.SEED)
+        
+        # Create datasets
+        train_dataset = AssemblyDataset(train_texts, train_labels, tokenizer, config.MAX_LEN)
+        val_dataset = AssemblyDataset(val_texts, val_labels, tokenizer, config.MAX_LEN)
+        test_dataset = AssemblyDataset(test_texts, test_labels, tokenizer, config.MAX_LEN)
+        
+        # Create data loaders
+        train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=8)
+        val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=8)
+        test_loader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=8)
+        
+        # Initialize model
+        # Initialize model with frozen transformer
+        model = AssemblyClassifier(model_name, freeze_bert=True).to(config.DEVICE)
+        model.transformer.resize_token_embeddings(len(tokenizer))
+        for name, param in model.named_parameters():
+                print(f"{name}: {'Trainable' if param.requires_grad else 'Frozen'}")
+        # Optimizer and scheduler
+        optimizer = AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
+        total_steps = len(train_loader) * config.EPOCHS
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=config.WARMUP_STEPS, num_training_steps=total_steps)
+        
+        # Train
+        trainer = AssemblyTrainer(model, tokenizer, config.DEVICE, config, special_tokens)
+        trainer.train(train_loader, val_loader, test_loader, optimizer, scheduler, model_name)
+
+if __name__ == "__main__":
+    train_model()
+
+
+
